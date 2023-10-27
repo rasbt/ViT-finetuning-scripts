@@ -7,35 +7,10 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ExponentialLR
 import torchmetrics
 from torchvision import transforms
-from torchvision import datasets
-from lightning.fabric.plugins import BitsandbytesPrecision
-from torch.utils.data import DataLoader
+from torchvision.models import vit_l_16
+from torchvision.models import ViT_L_16_Weights
 
-
-# Regular PyTorch Module
-class PyTorchModel(torch.nn.Module):
-    def __init__(self, input_size, hidden_units, num_classes):
-        super().__init__()
-
-        # Initialize MLP layers
-        all_layers = []
-        for hidden_unit in hidden_units:
-            layer = torch.nn.Linear(input_size, hidden_unit, bias=False)
-            all_layers.append(layer)
-            all_layers.append(torch.nn.ReLU())
-            input_size = hidden_unit
-
-        output_layer = torch.nn.Linear(
-            in_features=hidden_units[-1],
-            out_features=num_classes)
-
-        all_layers.append(output_layer)
-        self.layers = torch.nn.Sequential(*all_layers)
-
-    def forward(self, x):
-        x = torch.flatten(x, start_dim=1)  # to make it work for image inputs
-        x = self.layers(x)
-        return x  # x are the model's logits
+from local_utilities import get_dataloaders_cifar10
 
 
 def train(num_epochs, model, optimizer, train_loader, val_loader, fabric, scheduler):
@@ -52,7 +27,8 @@ def train(num_epochs, model, optimizer, train_loader, val_loader, fabric, schedu
             loss = F.cross_entropy(logits, targets)
 
             optimizer.zero_grad()
-            fabric.backward(loss)
+            loss.backward()
+
             ### UPDATE MODEL PARAMETERS
             optimizer.step()
 
@@ -88,33 +64,34 @@ if __name__ == "__main__":
 
     L.seed_everything(123)
 
-    train_dataset = datasets.MNIST(root='data',
-                                train=True,
-                                transform=transforms.ToTensor(),
-                                download=True)
+    ##########################
+    ### 1 Loading the Dataset
+    ##########################
+    train_transforms = transforms.Compose([transforms.Resize((224, 224)),
+                                           #transforms.RandomCrop((224, 224)),
+                                           transforms.ToTensor()])
 
-    test_dataset = datasets.MNIST(root='data',
-                                train=False,
-                                transform=transforms.ToTensor())
+    test_transforms = transforms.Compose([transforms.Resize((224, 224)),
+                                          #transforms.CenterCrop((224, 224)),
+                                          transforms.ToTensor()])
 
-
-    train_loader = DataLoader(dataset=train_dataset,
-                            batch_size=64,
-                            shuffle=True)
-
-    test_loader = DataLoader(dataset=test_dataset,
-                            batch_size=64,
-                            shuffle=False)
+    train_loader, val_loader, test_loader = get_dataloaders_cifar10(
+        batch_size=32,
+        num_workers=4,
+        train_transforms=train_transforms,
+        test_transforms=test_transforms,
+        validation_fraction=0.1,
+        download=True
+    )
 
     #########################################
     ### 2 Initializing the Model
     #########################################
 
-    model = PyTorchModel(
-        input_size=28*28,
-        hidden_units=[500, 500],
-        num_classes=10
-    )
+    model = vit_l_16(weights=ViT_L_16_Weights.IMAGENET1K_V1)
+
+    # replace output layer
+    model.heads.head = torch.nn.Linear(in_features=1024, out_features=10)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
     scheduler = ExponentialLR(optimizer, gamma=0.9)
@@ -123,13 +100,11 @@ if __name__ == "__main__":
     ### 3 Launch Fabric
     #########################################
 
-    # this will also use `bfloat16` by default
-    precision = BitsandbytesPrecision("nf4")
-    fabric = Fabric(plugins=precision)
+    fabric = Fabric(accelerator="cuda", devices=1)
     fabric.launch()
 
     train_loader, val_loader, test_loader = fabric.setup_dataloaders(
-        train_loader, train_loader, test_loader)
+        train_loader, val_loader, test_loader)
     model, optimizer = fabric.setup(model, optimizer)
 
     #########################################
